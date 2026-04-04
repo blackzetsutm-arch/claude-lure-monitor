@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 import os
 from datetime import datetime, timedelta, timezone
 from urllib.parse import quote
@@ -9,6 +10,8 @@ from urllib.parse import quote
 from models import RepoCandidate, ReleaseAsset, OwnerInfo
 from config import RELEASE_ARCHIVE_EXTENSIONS
 from .base import PlatformScanner
+
+logger = logging.getLogger("lure-monitor.gitlab")
 
 
 class GitLabScanner(PlatformScanner):
@@ -32,10 +35,16 @@ class GitLabScanner(PlatformScanner):
                         "created_after": since,
                     },
                 )
+                if resp.status_code == 429:
+                    logger.warning(f"GitLab rate limited on query: {query}")
+                    break
                 if resp.status_code != 200:
+                    logger.warning(f"GitLab search returned {resp.status_code} for: {query}")
                     continue
                 projects = resp.json()
-            except Exception:
+                logger.info(f"GitLab search '{query}': {len(projects)} results")
+            except Exception as e:
+                logger.error(f"GitLab search failed for '{query}': {e}")
                 continue
 
             for p in projects:

@@ -1,130 +1,184 @@
-"""GitHub platform scanner using gh CLI."""
+"""GitHub platform scanner using REST API (httpx)."""
 
 from __future__ import annotations
 
-import asyncio
-import base64
-import json
+import logging
 import os
 from datetime import datetime, timedelta, timezone
 
 from models import RepoCandidate, ReleaseAsset, OwnerInfo
-from config import KNOWN_MALICIOUS_REPOS, KNOWN_MALICIOUS_ACCOUNTS, RELEASE_ARCHIVE_EXTENSIONS
+from config import (
+    KNOWN_MALICIOUS_REPOS, KNOWN_MALICIOUS_ACCOUNTS, RELEASE_ARCHIVE_EXTENSIONS,
+)
 from .base import PlatformScanner
+
+logger = logging.getLogger("lure-monitor.github")
+
+# GitHub REST API base
+_API = "https://api.github.com"
+
+# Token from env — dramatically improves rate limits (10 → 30 search req/min)
+_TOKEN = os.environ.get("GITHUB_TOKEN", "")
 
 
 class GitHubScanner(PlatformScanner):
     name = "github"
-    base_url = "https://api.github.com"
+    base_url = _API
 
-    async def _gh(self, args: list[str]) -> str:
-        """Run gh CLI command async."""
-        proc = await asyncio.create_subprocess_exec(
-            "gh", *args,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-        )
-        stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=30)
-        if proc.returncode == 0:
-            return stdout.decode().strip()
-        return ""
+    async def _headers(self) -> dict[str, str]:
+        h = {
+            "Accept": "application/vnd.github+json",
+            "X-GitHub-Api-Version": "2022-11-28",
+        }
+        if _TOKEN:
+            h["Authorization"] = f"Bearer {_TOKEN}"
+        return h
+
+    async def client(self):
+        """Override to inject GitHub auth headers."""
+        if self._client is None or self._client.is_closed:
+            import httpx
+            self._client = httpx.AsyncClient(
+                timeout=30.0,
+                follow_redirects=True,
+                headers=await self._headers(),
+            )
+        return self._client
 
     async def search(self, queries: list[str], days_back: int) -> list[RepoCandidate]:
         since_date = (datetime.now(timezone.utc) - timedelta(days=days_back)).strftime("%Y-%m-%d")
         all_repos: dict[str, RepoCandidate] = {}
+        http = await self.client()
 
         for query in queries:
-            raw = await self._gh([
-                "search", "repos", query,
-                "--created", f">={since_date}",
-                "--json", "fullName,description,createdAt,updatedAt,stargazersCount,forksCount,url,owner",
-                "--limit", "50",
-            ])
-            if not raw:
-                continue
+            # GitHub search API: q=<query>+created:>=<date>
+            search_q = f"{query} created:>={since_date}"
             try:
-                repos = json.loads(raw)
-            except json.JSONDecodeError:
+                resp = await http.get(
+                    f"{_API}/search/repositories",
+                    params={
+                        "q": search_q,
+                        "sort": "updated",
+                        "order": "desc",
+                        "per_page": 50,
+                    },
+                )
+
+                if resp.status_code == 403:
+                    # Rate limited — log and stop querying
+                    logger.warning(f"GitHub rate limited on query: {query}")
+                    break
+                if resp.status_code != 200:
+                    logger.warning(f"GitHub search returned {resp.status_code} for: {query}")
+                    continue
+
+                data = resp.json()
+                items = data.get("items", [])
+                logger.info(f"GitHub search '{query}': {len(items)} results (total: {data.get('total_count', 0)})")
+
+            except Exception as e:
+                logger.error(f"GitHub search failed for '{query}': {e}")
                 continue
 
-            for repo in repos:
-                name = repo.get("fullName", "")
+            for repo in items:
+                name = repo.get("full_name", "")
                 if name and name not in all_repos:
+                    owner = repo.get("owner", {})
                     all_repos[name] = RepoCandidate(
                         platform="github",
                         repo_id=name,
                         repo_name=name,
-                        repo_url=repo.get("url", f"https://github.com/{name}"),
+                        repo_url=repo.get("html_url", f"https://github.com/{name}"),
                         description=repo.get("description", "") or "",
-                        owner_login=repo.get("owner", {}).get("login", ""),
-                        stars=repo.get("stargazersCount", 0),
-                        forks=repo.get("forksCount", 0),
-                        repo_created_at=repo.get("createdAt", ""),
+                        owner_login=owner.get("login", ""),
+                        stars=repo.get("stargazers_count", 0),
+                        forks=repo.get("forks_count", 0),
+                        repo_created_at=repo.get("created_at", ""),
                     )
 
         # Check known malicious repos directly
         for known_repo in KNOWN_MALICIOUS_REPOS:
             if known_repo not in all_repos:
-                raw = await self._gh(["api", f"/repos/{known_repo}", "--jq", "."])
-                if raw:
-                    try:
-                        d = json.loads(raw)
+                try:
+                    resp = await http.get(f"{_API}/repos/{known_repo}")
+                    if resp.status_code == 200:
+                        d = resp.json()
+                        owner = d.get("owner", {})
                         all_repos[known_repo] = RepoCandidate(
                             platform="github",
                             repo_id=known_repo,
                             repo_name=known_repo,
                             repo_url=d.get("html_url", f"https://github.com/{known_repo}"),
                             description=d.get("description", "") or "",
-                            owner_login=d.get("owner", {}).get("login", ""),
+                            owner_login=owner.get("login", ""),
                             stars=d.get("stargazers_count", 0),
                             forks=d.get("forks_count", 0),
                             repo_created_at=d.get("created_at", ""),
                         )
-                    except json.JSONDecodeError:
-                        pass
+                    elif resp.status_code == 404:
+                        logger.info(f"Known repo {known_repo} is gone (404)")
+                    else:
+                        logger.warning(f"Known repo {known_repo} returned {resp.status_code}")
+                except Exception as e:
+                    logger.error(f"Failed to check known repo {known_repo}: {e}")
 
         # Check repos from known malicious accounts
         for acct in KNOWN_MALICIOUS_ACCOUNTS:
-            raw = await self._gh(["api", f"/users/{acct}/repos", "--jq", ".[].full_name"])
-            if raw:
-                for repo_name in raw.strip().split("\n"):
-                    if repo_name and repo_name not in all_repos:
-                        repo_raw = await self._gh(["api", f"/repos/{repo_name}", "--jq", "."])
-                        if repo_raw:
-                            try:
-                                d = json.loads(repo_raw)
-                                all_repos[repo_name] = RepoCandidate(
-                                    platform="github",
-                                    repo_id=repo_name,
-                                    repo_name=repo_name,
-                                    repo_url=d.get("html_url", ""),
-                                    description=d.get("description", "") or "",
-                                    owner_login=d.get("owner", {}).get("login", ""),
-                                    stars=d.get("stargazers_count", 0),
-                                    forks=d.get("forks_count", 0),
-                                    repo_created_at=d.get("created_at", ""),
-                                )
-                            except json.JSONDecodeError:
-                                pass
+            try:
+                resp = await http.get(
+                    f"{_API}/users/{acct}/repos",
+                    params={"per_page": 30, "sort": "created"},
+                )
+                if resp.status_code == 200:
+                    for repo in resp.json():
+                        repo_name = repo.get("full_name", "")
+                        if repo_name and repo_name not in all_repos:
+                            owner = repo.get("owner", {})
+                            all_repos[repo_name] = RepoCandidate(
+                                platform="github",
+                                repo_id=repo_name,
+                                repo_name=repo_name,
+                                repo_url=repo.get("html_url", ""),
+                                description=repo.get("description", "") or "",
+                                owner_login=owner.get("login", ""),
+                                stars=repo.get("stargazers_count", 0),
+                                forks=repo.get("forks_count", 0),
+                                repo_created_at=repo.get("created_at", ""),
+                            )
+                elif resp.status_code == 404:
+                    logger.info(f"Known account {acct} is gone (404)")
+                else:
+                    logger.warning(f"Known account {acct} returned {resp.status_code}")
+            except Exception as e:
+                logger.error(f"Failed to check account {acct}: {e}")
 
+        logger.info(f"GitHub total unique repos: {len(all_repos)}")
         return list(all_repos.values())
 
     async def get_readme(self, repo_id: str) -> str:
-        raw = await self._gh(["api", f"/repos/{repo_id}/readme", "--jq", ".content"])
-        if not raw:
-            return ""
+        http = await self.client()
         try:
-            return base64.b64decode(raw.replace("\n", "")).decode("utf-8", errors="replace")
+            resp = await http.get(
+                f"{_API}/repos/{repo_id}/readme",
+                headers={"Accept": "application/vnd.github.raw+json"},
+            )
+            if resp.status_code == 200:
+                return resp.text[:10000]  # Cap at 10KB to save memory
         except Exception:
-            return ""
+            pass
+        return ""
 
     async def get_releases(self, repo_id: str) -> list[ReleaseAsset]:
-        raw = await self._gh(["api", f"/repos/{repo_id}/releases", "--jq", "."])
-        if not raw:
-            return []
+        http = await self.client()
         try:
-            releases = json.loads(raw)
-        except json.JSONDecodeError:
+            resp = await http.get(
+                f"{_API}/repos/{repo_id}/releases",
+                params={"per_page": 5},
+            )
+            if resp.status_code != 200:
+                return []
+            releases = resp.json()
+        except Exception:
             return []
 
         assets = []
@@ -149,25 +203,33 @@ class GitHubScanner(PlatformScanner):
         return assets
 
     async def get_file_tree(self, repo_id: str) -> list[str]:
-        raw = await self._gh([
-            "api", f"/repos/{repo_id}/git/trees/HEAD?recursive=1",
-            "--jq", ".tree[].path",
-        ])
-        if not raw:
+        http = await self.client()
+        try:
+            resp = await http.get(
+                f"{_API}/repos/{repo_id}/git/trees/HEAD",
+                params={"recursive": "1"},
+            )
+            if resp.status_code != 200:
+                return []
+            tree = resp.json().get("tree", [])
+            return [item.get("path", "") for item in tree]
+        except Exception:
             return []
-        return raw.strip().split("\n")
 
     async def get_owner_info(self, owner_login: str) -> OwnerInfo:
-        raw = await self._gh(["api", f"/users/{owner_login}"])
-        if not raw:
-            return OwnerInfo(login=owner_login)
+        http = await self.client()
         try:
-            d = json.loads(raw)
+            resp = await http.get(f"{_API}/users/{owner_login}")
+            if resp.status_code != 200:
+                return OwnerInfo(login=owner_login)
+            d = resp.json()
             age_days = None
             created = d.get("created_at", "")
             if created:
                 try:
-                    delta = datetime.now(timezone.utc) - datetime.fromisoformat(created.replace("Z", "+00:00"))
+                    delta = datetime.now(timezone.utc) - datetime.fromisoformat(
+                        created.replace("Z", "+00:00")
+                    )
                     age_days = delta.days
                 except ValueError:
                     pass
@@ -177,5 +239,5 @@ class GitHubScanner(PlatformScanner):
                 public_repos=d.get("public_repos", 0),
                 age_days=age_days,
             )
-        except json.JSONDecodeError:
+        except Exception:
             return OwnerInfo(login=owner_login)

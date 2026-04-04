@@ -19,6 +19,12 @@ import db
 from models import ScanProgress
 from scanner import run_scan
 
+# Configure logging so scanner debug output is visible in Render logs
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(name)s] %(levelname)s: %(message)s",
+    datefmt="%H:%M:%S",
+)
 logger = logging.getLogger("lure-monitor")
 
 

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 import os
 import re
 from datetime import datetime, timezone
@@ -17,6 +18,8 @@ from models import (
 )
 from platforms import PLATFORM_MAP
 from platforms.base import PlatformScanner
+
+logger = logging.getLogger("lure-monitor.scanner")
 
 
 # ── Scoring engine (ported from claude_lure_scanner.py) ──────────────────────
@@ -188,8 +191,11 @@ async def scan_platform(
     try:
         candidates = await scanner.search(config.SEARCH_QUERIES, days_back)
     except Exception as e:
+        logger.error(f"[{platform}] Search failed: {e}", exc_info=True)
         yield ScanProgress(platform=platform, status="error", message=f"Search failed: {e}")
         return
+
+    logger.info(f"[{platform}] Search returned {len(candidates)} raw candidates")
 
     # Filter high-star repos (keep known IOCs)
     filtered = []
@@ -198,6 +204,8 @@ async def scan_platform(
             if c.repo_name not in config.KNOWN_MALICIOUS_REPOS and c.owner_login not in config.KNOWN_MALICIOUS_ACCOUNTS:
                 continue
         filtered.append(c)
+
+    logger.info(f"[{platform}] After star filter: {len(filtered)} candidates (threshold: {star_threshold})")
 
     yield ScanProgress(
         platform=platform, status="inspecting",
@@ -348,6 +356,8 @@ async def run_scan(
     try:
         # Scan platforms SEQUENTIALLY — save to DB after each one
         for scanner in scanners:
+            logger.info(f"=== Starting platform: {scanner.name} ===")
+            platform_start = datetime.now(timezone.utc)
             try:
                 async for progress in scan_platform(scanner, days_back, star_threshold):
                     if progress_callback:
@@ -362,8 +372,11 @@ async def run_scan(
                         new_found += 1
 
                 await database.commit()
+                elapsed = (datetime.now(timezone.utc) - platform_start).total_seconds()
+                logger.info(f"=== {scanner.name} done: {len(results)} findings in {elapsed:.1f}s ===")
 
             except Exception as e:
+                logger.error(f"=== {scanner.name} FAILED: {e} ===", exc_info=True)
                 # Log error but continue to next platform
                 if progress_callback:
                     await progress_callback(ScanProgress(
